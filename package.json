@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:rbxm": "rojo build optic.project.json --output dist/Optic.rbxm",
     "test": "node scripts/test.mjs && node --test tests/*.test.mjs",
     "test:luau": "node scripts/test.mjs"
   },

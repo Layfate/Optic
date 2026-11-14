@@ -10,17 +10,19 @@ The refreshed interface uses Builder Sans, larger text, soft charcoal surfaces a
 
 ## Install in Studio
 
-The built plugin is **[`dist/Optic.rbxmx`](dist/Optic.rbxmx)**. Use a current Roblox Studio release.
+Download **[Optic.rbxm from the latest release](https://github.com/Layfate/Optic/releases/latest/download/Optic.rbxm)**. Use a current Roblox Studio release.
+
+The release also includes `Optic.rbxmx` (XML) and the standalone Luau script. Both model formats contain the same plugin; install only one. Built copies are also under [`dist/`](dist/).
 
 1. Open a temporary/baseplate place in Studio.
-2. In Explorer, right-click `ServerStorage` and choose **Insert from File…**. Select `dist/Optic.rbxmx`. The imported root is a Script named `Optic` with ModuleScript children.
+2. In Explorer, right-click `ServerStorage` and choose **Insert from File…**. Select the downloaded `Optic.rbxm` (or `Optic.rbxmx`). The imported root is a Script named `Optic` with ModuleScript children.
 3. Right-click the imported `Optic` Script and choose **Save as Local Plugin…**. Save it as **Optic**. Depending on the Studio version, this action may also appear in the Plugins tools.
 4. Remove the imported Script from the temporary place after saving the local plugin. It is an installation container; it does not belong in a published game.
 5. Use the **Optic** button on Studio's Plugins toolbar to open the panel. Restart Studio if the local plugin does not appear immediately.
 
 Optic opens as a floating panel on first launch so Studio cannot squeeze it below Explorer. You can dock it afterward. The action row adapts to narrow docks, including widths below Studio's requested minimum.
 
-Alternative: open Studio's **Plugins Folder** from its Plugins tools, copy `dist/Optic.plugin.luau` there with the filename **`Optic.lua`**, then restart Studio. Install only one of the two artifacts to avoid duplicate plugins. The `.rbxmx` route is recommended because it preserves readable ModuleScripts for inspection.
+Alternative: open Studio's **Plugins Folder** from its Plugins tools, copy the downloaded `Optic.rbxm` there, then restart Studio. You can also use `Optic.plugin.luau` with the filename **`Optic.lua`**. Install one artifact to avoid duplicate plugins. Both model formats preserve readable ModuleScripts for inspection.
 
 No HTTP permission is needed. Source reading uses Studio plugin permissions; if Studio requests script access, grant it to enable analysis. Unreadable sources are counted in scan coverage. CPU capture additionally needs access to the documented profiler service and a running Play context.
 
@@ -75,6 +77,14 @@ npm.cmd test
 ```
 
 The build is deterministic and emits both artifacts under `dist/`. Edit `src/`, then rebuild. `npm.cmd` avoids PowerShell's execution policy blocking `npm.ps1`.
+
+To produce the binary release model, install [Rojo](https://rojo.space/docs/v7/getting-started/installation/) (release builds use 7.7.1), then run:
+
+```powershell
+npm.cmd run build:rbxm
+```
+
+`optic.project.json` packages the same Script root and ModuleScript children as the XML build. Rojo is a build tool only and is not required to use Optic. Release assets include SHA-256 checksums in `SHA256SUMS.txt`.
 
 ```text
 src/                     Native plugin entry, UI, service adapters and pure core
