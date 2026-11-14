@@ -1,0 +1,84 @@
+{
+    "date":  "2026-11-14",
+    "studioVersion":  "0.747.0.7471481",
+    "method":  "Native Roblox Studio local scratch place; temporary test bridge invoked production UI callbacks. Clean package restored afterward.",
+    "edit":  {
+                 "startup":  true,
+                 "tabs":  true,
+                 "projectScan":  {
+                                     "scanned":  3,
+                                     "findings":  1,
+                                     "expectedRule":  "connection-loop",
+                                     "expectedLine":  3
+                                 },
+                 "sourceNavigation":  true,
+                 "selectionDeduplication":  {
+                                                "scanned":  2
+                                            },
+                 "memoryBaseline":  true,
+                 "jsonAndMarkdown":  true,
+                 "paginatedReport":  {
+                                         "pages":  2,
+                                         "findings":  51
+                                     },
+                 "scanCancellation":  true,
+                 "hiddenSamplingPaused":  true,
+                 "narrowDockWidth426":  true
+             },
+    "client":  {
+                   "top":  {
+                               "durationMs":  171.545,
+                               "path":  "\u003cunavailable\u003e",
+                               "name":  "CameraModule",
+                               "percent":  1.1425669375249768
+                           },
+                   "functionCount":  85,
+                   "durationMs":  15014,
+                   "status":  "PASS",
+                   "fixture":  {
+                                   "line":  4,
+                                   "name":  "\u003canonymous\u003e",
+                                   "durationMs":  122.549,
+                                   "percent":  0.8162315172505662,
+                                   "path":  "Players.Layfate.PlayerScripts.OpticClientFixture"
+                               },
+                   "excludedPluginFunctions":  9,
+                   "target":  "client"
+               },
+    "server":  {
+                   "top":  {
+                               "durationMs":  19.043,
+                               "path":  "\u003cunavailable\u003e",
+                               "name":  "OpticCpuFixture",
+                               "percent":  0.12697026270169355
+                           },
+                   "functionCount":  4,
+                   "durationMs":  14998,
+                   "status":  "PASS",
+                   "fixture":  {
+                                   "line":  4,
+                                   "name":  "\u003canonymous\u003e",
+                                   "durationMs":  19.043,
+                                   "percent":  0.12697026270169355,
+                                   "path":  "ServerScriptService.OpticCpuFixture"
+                               },
+                   "excludedPluginFunctions":  8,
+                   "target":  "server"
+               },
+    "lifecycle":  {
+                      "panelCloseCancelsCapture":  true,
+                      "playExitCancelsCapture":  true,
+                      "consoleErrors":  0,
+                      "readOnlyReportSelection":  true
+                  },
+    "fixes":  [
+                  "Preserve raw JSON microseconds rather than ScriptProfilerService.DeserializeJSON seconds.",
+                  "Exclude known plugin source paths when native Flags are unset.",
+                  "Use responsive action widths for narrow Studio docks.",
+                  "Open first launch as a floating dockable panel to avoid undersized right-dock layout."
+              ],
+    "cleanInstall":  {
+                         "sha256":  "6875CCB2B9200D81A0734717107D76A41AD7D34F822B94D967B169AC052DCD2A",
+                         "bridgeAbsent":  true
+                     }
+}

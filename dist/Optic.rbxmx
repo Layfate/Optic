@@ -1,0 +1,1269 @@
+<?xml version="1.0" encoding="utf-8"?>
+<roblox version="4"><Item class="Script" referent="OpticRoot"><Properties><string name="Name">Optic</string><ProtectedString name="Source">--!strict
+-- This Script is the root of the installable plugin model.
+assert(plugin, &quot;Optic must be installed as a Roblox Studio plugin.&quot;)
+require(script.App).start(plugin)
+</ProtectedString></Properties><Item class="ModuleScript" referent="OpticApp"><Properties><string name="Name">App</string><ProtectedString name="Source">--!strict
+local Studio = require(script.Parent.Studio)
+local UI = require(script.Parent.UI)
+local Report = require(script.Parent.Report)
+local Brand = require(script.Parent.Brand)
+local App = {}
+
+function App.start(plugin)
+    local function setting(name, fallback, allowed)
+        local ok, value = pcall(function() return plugin:GetSetting(&quot;Optic.&quot; .. name) end)
+        return if ok and allowed[value] then value else fallback
+    end
+    local scope = setting(&quot;Scope&quot;, &quot;project&quot;, {project = true, selection = true})
+    local target = setting(&quot;Target&quot;, &quot;client&quot;, {client = true, server = true})
+    local format = setting(&quot;Format&quot;, &quot;json&quot;, {json = true, markdown = true})
+    local function save(name, value) pcall(function() plugin:SetSetting(&quot;Optic.&quot; .. name, value) end) end
+    local toolbar = plugin:CreateToolbar(&quot;Optic&quot;)
+    local toggle = toolbar:CreateButton(&quot;Optic.Toggle&quot;, &quot;Open Optic — Roblox Performance Profiler&quot;, Brand.Logo, &quot;Optic&quot;)
+    toggle.ClickableWhenViewportHidden = true
+    -- A floating first launch avoids Studio squeezing a new right dock below Explorer.
+    local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 800, 740, 480, 440)
+    local ok, widget = pcall(function() return plugin:CreateDockWidgetPluginGuiAsync(&quot;Optic.Profiler.v2&quot;, info) end)
+    if not ok then widget = plugin:CreateDockWidgetPluginGui(&quot;Optic.Profiler.v2&quot;, info) end
+    widget.Title = &quot;Optic — Roblox Performance Profiler&quot;
+    local alive, ui, studio = true, nil, nil
+    local queued = false
+    local function state()
+        return {timestamp = DateTime.now():ToIsoDate(), context = studio:context(), scope = scope, target = target,
+            format = format, notice = studio.notice, scanning = studio.scanning, findings = studio.findings,
+            coverage = studio.coverage, metrics = studio.metrics:summary(), memory = studio.metrics:memory(),
+            samples = studio.metrics.samples, cpu = studio.capture.state}
+    end
+    local function render()
+        if alive and ui and studio and widget.Enabled then ui:render(state()) end
+    end
+    local function changed()
+        if not alive or queued then return end
+        queued = true
+        -- Scan batches can arrive every frame; cap automatic GUI refreshes at 2 Hz.
+        task.delay(0.5, function() queued = false; render() end)
+    end
+    studio = Studio.new(changed)
+    local reportSnapshot
+    ui = UI.new(widget, {
+        scope = function() scope = if scope == &quot;project&quot; then &quot;selection&quot; else &quot;project&quot;; save(&quot;Scope&quot;, scope); changed() end,
+        scan = function() if studio.scanning then studio:cancelScan() else studio:scan(scope) end end,
+        target = function()
+            if studio.capture.state.status == &quot;recording&quot; or studio.capture.state.status == &quot;waiting&quot; then
+                studio.notice = &quot;Finish the current CPU capture before changing its target.&quot;; changed(); return
+            end
+            target = if target == &quot;client&quot; then &quot;server&quot; else &quot;client&quot;; save(&quot;Target&quot;, target); changed()
+        end,
+        capture = function()
+            if studio.capture.state.status == &quot;recording&quot; then studio.capture:stop()
+            elseif studio.capture.state.status ~= &quot;waiting&quot; then studio.capture:start(target) end
+        end,
+        baseline = function()
+            studio:sample()
+            studio.notice = if studio.metrics:baseline() then &quot;Memory baseline set for the current Studio session.&quot; else &quot;Memory is unavailable; a baseline could not be set.&quot;
+            changed()
+        end,
+        open = function(finding) studio:open(finding) end,
+        format = function()
+            format = if format == &quot;json&quot; then &quot;markdown&quot; else &quot;json&quot;; save(&quot;Format&quot;, format)
+            if reportSnapshot then
+                ui:setReport(if format == &quot;json&quot; then studio.http:JSONEncode(reportSnapshot) else Report.markdown(reportSnapshot))
+            end
+            changed()
+        end,
+        report = function()
+            reportSnapshot = Report.snapshot(state())
+            ui:setReport(if format == &quot;json&quot; then studio.http:JSONEncode(reportSnapshot) else Report.markdown(reportSnapshot))
+            studio.notice = &quot;Report frozen. Copy pages in order into a local file; use Generate to refresh it.&quot;; changed()
+        end,
+    })
+    local connections = {}
+    local function visibility()
+        toggle:SetActive(widget.Enabled)
+        studio:setSampling(widget.Enabled)
+        if not widget.Enabled then studio:cancelScan(); studio.capture:cancel() end
+        render()
+    end
+    table.insert(connections, toggle.Click:Connect(function() widget.Enabled = not widget.Enabled end))
+    table.insert(connections, widget:GetPropertyChangedSignal(&quot;Enabled&quot;):Connect(visibility))
+    widget:BindToClose(function() widget.Enabled = false end)
+    local unload
+    unload = plugin.Unloading:Connect(function()
+        if not alive then return end
+        alive = false; studio:destroy(); ui:destroy()
+        for _, connection in connections do connection:Disconnect() end
+        if unload then unload:Disconnect() end
+        widget:Destroy(); toolbar:Destroy()
+    end)
+    visibility()
+end
+return App
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticBrand"><Properties><string name="Name">Brand</string><ProtectedString name="Source">--!strict
+-- Original user-supplied logo, preserved at assets/optic-logo.png.
+return {
+    Logo = &quot;rbxassetid://132748276015974&quot;,
+    Name = &quot;Optic&quot;,
+}
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticCapture"><Properties><string name="Name">Capture</string><ProtectedString name="Source">--!strict
+local Profile = require(script.Parent.Profile)
+local Capture = {}
+Capture.__index = Capture
+
+function Capture.new(adapter, changed)
+    local self = setmetatable({adapter = adapter, changed = changed, generation = 0,
+        owned = false, destroyed = false, state = {status = &quot;idle&quot;, message = &quot;Start Play, then record a 15-second CPU sample.&quot;, rows = {}}}, Capture)
+    local ok, connection = pcall(adapter.subscribe, function(player, data) self:_receive(player, data) end)
+    if ok then self.connection = connection
+    else self.state = {status = &quot;unavailable&quot;, message = &quot;Script profiler access is unavailable: &quot; .. tostring(connection), rows = {}} end
+    return self
+end
+function Capture:_status(status, message)
+    self.state.status = status; self.state.message = message
+    if not self.destroyed then self.changed() end
+end
+function Capture:start(target)
+    if self.destroyed or not self.connection or self.owned or self.state.status == &quot;waiting&quot; then return false end
+    if target ~= &quot;client&quot; and target ~= &quot;server&quot; then return false end
+    if not self.adapter.isRunning() then self:_status(&quot;error&quot;, &quot;Start a Studio Play test before recording CPU.&quot;); return false end
+    local player = if target == &quot;client&quot; then self.adapter.localPlayer() else nil
+    if target == &quot;client&quot; and not player then
+        self:_status(&quot;error&quot;, &quot;No local client is available in this Studio context. Try server capture or a client Play window.&quot;)
+        return false
+    end
+    local startedAt = self.adapter.timestamp()
+    local ok, problem = pcall(self.adapter.start, target, player)
+    if not ok then self:_status(&quot;error&quot;, &quot;Could not start CPU capture: &quot; .. tostring(problem)); return false end
+    self.generation += 1
+    local generation = self.generation
+    self.owned = true; self.player = player; self.target = target; self.startedAt = startedAt
+    self.state = {status = &quot;recording&quot;, target = target, message = &quot;Recording &quot; .. target .. &quot; at 1 kHz · stops after 15 seconds.&quot;, rows = {}}
+    self.changed()
+    self.adapter.delay(15, function()
+        if not self.destroyed and self.generation == generation and self.state.status == &quot;recording&quot; then self:stop() end
+    end)
+    return true
+end
+function Capture:stop()
+    if self.destroyed or not self.owned or self.state.status ~= &quot;recording&quot; then return end
+    local ok, problem = pcall(self.adapter.stop, self.target, self.player)
+    if not ok then self:_status(&quot;error&quot;, &quot;Could not stop the profiler: &quot; .. tostring(problem)); return end
+    self.owned = false
+    self:_status(&quot;waiting&quot;, &quot;Capture stopped. Waiting for the profiler snapshot…&quot;)
+    local generation = self.generation
+    ok, problem = pcall(self.adapter.request, self.target, self.player)
+    if not ok then self:_status(&quot;error&quot;, &quot;Could not request CPU results: &quot; .. tostring(problem)); return end
+    self.adapter.delay(8, function()
+        if not self.destroyed and self.generation == generation and self.state.status == &quot;waiting&quot; then
+            self:_status(&quot;error&quot;, &quot;No profiler reply arrived within 8 seconds. Try another Play capture.&quot;)
+        end
+    end)
+end
+function Capture:_receive(player, raw)
+    if self.destroyed or self.state.status ~= &quot;waiting&quot; then return end
+    if self.target == &quot;client&quot; and player ~= self.player then return end
+    if self.target == &quot;server&quot; and player ~= nil then return end
+    local ok, decoded = pcall(self.adapter.decode, raw)
+    if not ok then self:_status(&quot;error&quot;, &quot;Could not decode the CPU snapshot: &quot; .. tostring(decoded)); return end
+    if type(decoded) ~= &quot;table&quot; or type(decoded.SessionStartTime) ~= &quot;number&quot; or type(decoded.SessionEndTime) ~= &quot;number&quot;
+        or decoded.SessionStartTime ~= decoded.SessionStartTime or decoded.SessionEndTime ~= decoded.SessionEndTime
+        or math.abs(decoded.SessionStartTime) == math.huge or math.abs(decoded.SessionEndTime) == math.huge then
+        self:_status(&quot;error&quot;, &quot;The CPU snapshot has no valid session timestamps; its recording cannot be identified.&quot;)
+        return
+    end
+    if decoded.SessionStartTime &lt; self.startedAt or decoded.SessionEndTime &lt; self.startedAt then return end
+    local result, problem = Profile.normalize(decoded)
+    if not result then self:_status(&quot;error&quot;, problem); return end
+    result.status = &quot;complete&quot;; result.target = self.target
+    result.message = if #result.rows &gt; 0 then &quot;Measured CPU functions · inclusive sampled time.&quot; else &quot;Capture returned no game functions. Exercise the workload while recording.&quot;
+    self.state = result; self.changed()
+end
+function Capture:cancel()
+    if self.destroyed then return end
+    self.generation += 1
+    if self.owned then
+        local ok, problem = pcall(self.adapter.stop, self.target, self.player)
+        if not ok then self:_status(&quot;error&quot;, &quot;Profiler cleanup failed: &quot; .. tostring(problem)); return end
+        self.owned = false
+    end
+    if self.state.status == &quot;recording&quot; or self.state.status == &quot;waiting&quot; or self.state.status == &quot;error&quot; then
+        self:_status(&quot;cancelled&quot;, &quot;CPU capture cancelled. Start a new recording during Play.&quot;)
+    end
+end
+function Capture:destroy()
+    if self.destroyed then return end
+    self:cancel(); self.destroyed = true
+    if self.connection then self.connection:Disconnect(); self.connection = nil end
+    self.changed = function() end
+end
+return Capture
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticLexer"><Properties><string name="Name">Lexer</string><ProtectedString name="Source">--!strict
+-- Lightweight lexical masking, not a Luau parser. Offsets and newlines survive masking.
+local Lexer = {}
+
+local function longOpen(source: string, index: number): (number?, number?)
+    if string.byte(source, index) ~= 91 then return nil, nil end
+    local cursor = index + 1
+    while string.byte(source, cursor) == 61 do cursor += 1 end
+    if string.byte(source, cursor) == 91 then return cursor - index - 1, cursor - index + 1 end
+    return nil, nil
+end
+
+local function skipLong(source: string, index: number): number?
+    local level, width = longOpen(source, index)
+    if level == nil or not width then return nil end
+    local _, finish = string.find(source, &quot;]&quot; .. string.rep(&quot;=&quot;, level) .. &quot;]&quot;, index + width, true)
+    return if finish then finish + 1 else #source + 1
+end
+
+local skipQuoted
+skipQuoted = function(source: string, index: number, depth: number): number
+    if depth &gt; 64 then return #source + 1 end
+    local quote, cursor = string.sub(source, index, index), index + 1
+    while cursor &lt;= #source do
+        local ch = string.sub(source, cursor, cursor)
+        if ch == &quot;\\&quot; then cursor += 2
+        elseif ch == quote then return cursor + 1
+        elseif quote == &quot;`&quot; and ch == &quot;{&quot; then
+            local braces = 1
+            cursor += 1
+            while cursor &lt;= #source and braces &gt; 0 do
+                local inner = string.sub(source, cursor, cursor)
+                if string.sub(source, cursor, cursor + 1) == &quot;--&quot; then
+                    cursor = skipLong(source, cursor + 2) or (string.find(source, &quot;\n&quot;, cursor, true) or (#source + 1))
+                elseif inner == &apos;&quot;&apos; or inner == &quot;&apos;&quot; or inner == &quot;`&quot; then cursor = skipQuoted(source, cursor, depth + 1)
+                elseif inner == &quot;[&quot; then cursor = skipLong(source, cursor) or (cursor + 1)
+                elseif inner == &quot;{&quot; then braces += 1; cursor += 1
+                elseif inner == &quot;}&quot; then braces -= 1; cursor += 1
+                else cursor += 1 end
+            end
+        else cursor += 1 end
+    end
+    return #source + 1
+end
+
+function Lexer.mask(source: string): string
+    local pieces = {}
+    local index, size = 1, #source
+    local function blank(first: number, last: number)
+        table.insert(pieces, (string.gsub(string.sub(source, first, last), &quot;[^\n]&quot;, &quot; &quot;)))
+    end
+    while index &lt;= size do
+        local ch = string.sub(source, index, index)
+        local comment = string.sub(source, index, index + 1) == &quot;--&quot;
+        local start = if comment then index + 2 else index
+        local longEnd = skipLong(source, start)
+        if longEnd then
+            blank(index, longEnd - 1)
+            index = longEnd
+        elseif comment then
+            local finish = (string.find(source, &quot;\n&quot;, index, true) or (size + 1)) - 1
+            blank(index, finish)
+            index = finish + 1
+        elseif ch == &apos;&quot;&apos; or ch == &quot;&apos;&quot; or ch == &quot;`&quot; then
+            -- Mask whole interpolations, including expressions and nested literals.
+            local finish = skipQuoted(source, index, 0)
+            blank(index, math.min(size, finish - 1))
+            index = finish
+        else
+            table.insert(pieces, ch)
+            index += 1
+        end
+    end
+    return table.concat(pieces)
+end
+
+function Lexer.tokens(source: string)
+    local masked = Lexer.mask(source)
+    local tokens = {}
+    local index, line = 1, 1
+    while index &lt;= #masked do
+        local ch = string.sub(masked, index, index)
+        if ch == &quot;\n&quot; then line += 1; index += 1
+        elseif string.match(ch, &quot;%s&quot;) then index += 1
+        elseif string.match(ch, &quot;[%a_]&quot;) then
+            local finish = index + 1
+            while finish &lt;= #masked and string.match(string.sub(masked, finish, finish), &quot;[%w_]&quot;) do finish += 1 end
+            local value = string.sub(masked, index, finish - 1)
+            table.insert(tokens, {value = value, line = line})
+            index += #value
+        else
+            table.insert(tokens, {value = ch, line = line})
+            index += 1
+        end
+    end
+    return tokens
+end
+
+return Lexer
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticMetrics"><Properties><string name="Name">Metrics</string><ProtectedString name="Source">--!strict
+local Metrics = {}
+Metrics.__index = Metrics
+
+local function valid(value)
+    return type(value) == &quot;number&quot; and value == value and value &gt;= 0 and value &lt; math.huge
+end
+local function cleanCategories(categories)
+    local result = {}
+    if type(categories) == &quot;table&quot; then
+        for name, value in categories do
+            if type(name) == &quot;string&quot; and valid(value) then result[name] = value end
+        end
+    end
+    return result
+end
+function Metrics.new(limit: number?)
+    return setmetatable({samples = {}, limit = math.max(1, limit or 120), baselineSample = nil}, Metrics)
+end
+function Metrics:push(input)
+    if not valid(input.time) then return false end
+    local previous = self.samples[#self.samples]
+    if previous and input.time &lt;= previous.time then return false end
+    local sample = {time = input.time, categories = cleanCategories(input.categories)}
+    for _, name in {&quot;frameMs&quot;, &quot;memoryMb&quot;, &quot;instances&quot;, &quot;heartbeatMs&quot;, &quot;physicsMs&quot;} do
+        if valid(input[name]) then sample[name] = input[name] end
+    end
+    table.insert(self.samples, sample)
+    if #self.samples &gt; self.limit then table.remove(self.samples, 1) end
+    return true
+end
+function Metrics:summary()
+    local latest = self.samples[#self.samples]
+    if not latest then return {sampleCount = 0} end
+    local frames, sum = {}, 0
+    for _, sample in self.samples do
+        if sample.frameMs and sample.frameMs &gt; 0 then
+            table.insert(frames, sample.frameMs); sum += sample.frameMs
+        end
+    end
+    table.sort(frames)
+    local mean = if #frames &gt; 0 then sum / #frames else nil
+    return {sampleCount = #self.samples, frameMs = mean,
+        p95FrameMs = if #frames &gt; 0 then frames[math.ceil(#frames * 0.95)] else nil,
+        fps = if mean and mean &gt; 0 then 1000 / mean else nil,
+        memoryMb = latest.memoryMb, instances = latest.instances,
+        heartbeatMs = latest.heartbeatMs, physicsMs = latest.physicsMs}
+end
+function Metrics:baseline()
+    local latest = self.samples[#self.samples]
+    if not latest or not latest.memoryMb then return false end
+    self.baselineSample = {time = latest.time, memoryMb = latest.memoryMb,
+        categories = table.clone(latest.categories)}
+    return true
+end
+function Metrics:memory()
+    local latest = self.samples[#self.samples]
+    local result = {categories = if latest then table.clone(latest.categories) else {},
+        categoryDeltas = {}, hasBaseline = self.baselineSample ~= nil}
+    if not latest then return result end
+    result.totalMb = latest.memoryMb
+    local baseline = self.baselineSample
+    if baseline then
+        result.baselineMb = baseline.memoryMb
+        result.baselineTime = baseline.time
+        if latest.memoryMb then result.deltaMb = latest.memoryMb - baseline.memoryMb end
+        for name, value in latest.categories do
+            if baseline.categories[name] then result.categoryDeltas[name] = value - baseline.categories[name] end
+        end
+    end
+    local points = {}
+    for _, sample in self.samples do if sample.memoryMb then table.insert(points, sample) end end
+    if #points &lt; 10 then return result end
+    local first = points[1].time
+    local duration = points[#points].time - first
+    if duration &lt; 10 then return result end
+    local sumX, sumY = 0, 0
+    for _, point in points do sumX += point.time - first; sumY += point.memoryMb end
+    local meanX, meanY = sumX / #points, sumY / #points
+    local numerator, denominator = 0, 0
+    for _, point in points do
+        local x = point.time - first - meanX
+        numerator += x * (point.memoryMb - meanY); denominator += x * x
+    end
+    result.observationSeconds = duration
+    if denominator &gt; 0 then
+        local slope = numerator / denominator * 60
+        if slope &gt; 0.1 then result.growthMbPerMinute = slope end
+    end
+    return result
+end
+return Metrics
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticProfile"><Properties><string name="Name">Profile</string><ProtectedString name="Source">--!strict
+local Profile = {}
+local function finite(value)
+    return type(value) == &quot;number&quot; and value == value and math.abs(value) &lt; math.huge
+end
+local function text(value, fallback)
+    return if type(value) == &quot;string&quot; and value ~= &quot;&quot; then string.sub(value, 1, 1024) else fallback
+end
+local function pluginSource(source)
+    if type(source) ~= &quot;string&quot; then return false end
+    return string.match(source, &quot;^user_.-%.rbxmx?%.&quot;) ~= nil
+        or string.match(source, &quot;^cloud_%d+%.&quot;) ~= nil
+        or string.match(source, &quot;^builtin_.-%.rbxmx?%.&quot;) ~= nil
+        or string.match(source, &quot;^sabuiltin_.-%.rbxmx?%.&quot;) ~= nil
+end
+function Profile.normalize(data)
+    if type(data) ~= &quot;table&quot; or type(data.Functions) ~= &quot;table&quot; then
+        return nil, &quot;The profiler snapshot has no supported Functions array.&quot;
+    end
+    local duration
+    if finite(data.SessionStartTime) and finite(data.SessionEndTime)
+        and data.SessionEndTime &gt; data.SessionStartTime then
+        duration = data.SessionEndTime - data.SessionStartTime
+    end
+    local rows, inspected, excluded = {}, 0, 0
+    for _, fn in data.Functions do
+        inspected += 1
+        if inspected &gt; 50000 then break end
+        if type(fn) ~= &quot;table&quot; then continue end
+        local flags = if finite(fn.Flags) and fn.Flags &gt;= 0 then math.floor(fn.Flags) else 0
+        if bit32.band(flags, 2) ~= 0 or pluginSource(fn.Source) then excluded += 1; continue end
+        if not finite(fn.TotalDuration) or fn.TotalDuration &lt; 0 then continue end
+        local ms = fn.TotalDuration / 1000
+        table.insert(rows, {name = text(fn.Name, &quot;&lt;anonymous&gt;&quot;), path = text(fn.Source, &quot;&lt;unavailable&gt;&quot;),
+            line = if finite(fn.Line) and fn.Line &gt;= 1 then math.floor(fn.Line) else nil,
+            durationMs = ms, percent = if duration then ms / duration * 100 else nil})
+    end
+    table.sort(rows, function(a, b)
+        if a.durationMs == b.durationMs then return a.path .. a.name &lt; b.path .. b.name end
+        return a.durationMs &gt; b.durationMs
+    end)
+    local total = #rows
+    while #rows &gt; 100 do table.remove(rows) end
+    return {rows = rows, durationMs = duration, functionCount = total,
+        excludedPluginFunctions = excluded, truncated = total &gt; 100 or inspected &gt; 50000,
+        semantics = &quot;Inclusive sampled CPU time; function costs overlap and must not be summed.&quot;}
+end
+return Profile
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticReport"><Properties><string name="Name">Report</string><ProtectedString name="Source">--!strict
+local Report = {}
+local function pick(input, keys)
+    local result = {}
+    for _, key in keys do
+        local value = input[key]
+        if type(value) == &quot;string&quot; or type(value) == &quot;boolean&quot; then result[key] = value
+        elseif type(value) == &quot;number&quot; and value == value and math.abs(value) &lt; math.huge then result[key] = value end
+    end
+    return result
+end
+function Report.snapshot(state)
+    local report = {schemaVersion = 1, product = &quot;Optic — Roblox Performance Profiler&quot;, version = &quot;0.1.0&quot;,
+        timestamp = state.timestamp or &quot;Unavailable&quot;, context = state.context or &quot;Current Studio session&quot;,
+        limitations = {
+            &quot;Static findings are heuristics, not measured live connection counts or confirmed leaks.&quot;,
+            &quot;Session memory includes Studio/plugin overhead; it is not per-script memory.&quot;,
+            &quot;CPU function costs are inclusive and overlap; never sum them as total CPU usage.&quot;,
+            &quot;Memory growth is an observation requiring investigation, not proof of a leak.&quot;
+        }, findings = {}, coverage = {}, metrics = {}, memory = {}, cpu = {}}
+    for _, finding in state.findings or {} do
+        if #report.findings &gt;= 500 then break end
+        table.insert(report.findings, pick(finding, {&quot;rule&quot;, &quot;path&quot;, &quot;line&quot;, &quot;severity&quot;, &quot;confidence&quot;, &quot;title&quot;, &quot;evidence&quot;, &quot;explanation&quot;, &quot;recommendation&quot;}))
+    end
+    report.coverage = pick(state.coverage or {}, {&quot;scope&quot;, &quot;scanned&quot;, &quot;unreadable&quot;, &quot;skipped&quot;, &quot;candidates&quot;, &quot;truncated&quot;, &quot;cancelled&quot;, &quot;sourceLimitBytes&quot;, &quot;scriptLimit&quot;, &quot;findingLimit&quot;, &quot;scanContext&quot;, &quot;scannedAt&quot;})
+    report.coverage.inProgress = state.scanning == true
+    report.coverage.partial = report.coverage.inProgress or report.coverage.truncated == true or report.coverage.cancelled == true
+        or (report.coverage.unreadable or 0) &gt; 0 or (report.coverage.skipped or 0) &gt; 0 or report.coverage.scope == nil
+    report.metrics = pick(state.metrics or {}, {&quot;sampleCount&quot;, &quot;frameMs&quot;, &quot;p95FrameMs&quot;, &quot;fps&quot;, &quot;memoryMb&quot;, &quot;instances&quot;, &quot;heartbeatMs&quot;, &quot;physicsMs&quot;})
+    local memory = state.memory or {}
+    report.memory = pick(memory, {&quot;totalMb&quot;, &quot;baselineMb&quot;, &quot;baselineTime&quot;, &quot;deltaMb&quot;, &quot;hasBaseline&quot;, &quot;growthMbPerMinute&quot;, &quot;observationSeconds&quot;})
+    report.memory.categories = pick(memory.categories or {}, {&quot;LuaHeap&quot;, &quot;Script&quot;, &quot;Signals&quot;, &quot;Instances&quot;, &quot;GraphicsTexture&quot;, &quot;PhysicsCollision&quot;})
+    report.memory.categoryDeltas = pick(memory.categoryDeltas or {}, {&quot;LuaHeap&quot;, &quot;Script&quot;, &quot;Signals&quot;, &quot;Instances&quot;, &quot;GraphicsTexture&quot;, &quot;PhysicsCollision&quot;})
+    local cpu = state.cpu or {}
+    report.cpu = pick(cpu, {&quot;status&quot;, &quot;message&quot;, &quot;target&quot;, &quot;durationMs&quot;, &quot;functionCount&quot;, &quot;excludedPluginFunctions&quot;, &quot;truncated&quot;, &quot;semantics&quot;})
+    report.cpu.rows = {}
+    for _, row in cpu.rows or {} do
+        if #report.cpu.rows &gt;= 100 then break end
+        table.insert(report.cpu.rows, pick(row, {&quot;name&quot;, &quot;path&quot;, &quot;line&quot;, &quot;durationMs&quot;, &quot;percent&quot;}))
+    end
+    return report
+end
+local function cell(value)
+    local result = tostring(value or &quot;Unavailable&quot;)
+    result = string.gsub(result, &quot;\\&quot;, &quot;\\\\&quot;)
+    result = string.gsub(result, &quot;|&quot;, &quot;\\|&quot;)
+    result = string.gsub(result, &quot;\r&quot;, &quot;&quot;)
+    return (string.gsub(result, &quot;\n&quot;, &quot;&lt;br&gt;&quot;))
+end
+local function number(value, suffix)
+    return if type(value) == &quot;number&quot; then string.format(&quot;%.2f%s&quot;, value, suffix or &quot;&quot;) else &quot;Unavailable&quot;
+end
+function Report.markdown(report)
+    local lines = {&quot;# Optic — Roblox Performance Profiler&quot;, &quot;&quot;, &quot;Captured: &quot; .. cell(report.timestamp),
+        &quot;Context: &quot; .. cell(report.context), &quot;&quot;, &quot;## Coverage&quot;, &quot;&quot;}
+    local coverage = report.coverage or {}
+    table.insert(lines, string.format(&quot;Scope: %s · Scanned: %s · Unreadable: %s · Skipped: %s · Partial: %s&quot;,
+        cell(coverage.scope), tostring(coverage.scanned or 0), tostring(coverage.unreadable or 0),
+        tostring(coverage.skipped or 0), tostring(coverage.partial == true)))
+    local m, memory = report.metrics or {}, report.memory or {}
+    table.insert(lines, &quot;\n## Session metrics\n&quot;)
+    table.insert(lines, &quot;| Metric | Value |\n| --- | --- |&quot;)
+    for _, pair in {{&quot;Mean frame time&quot;, number(m.frameMs, &quot; ms&quot;)}, {&quot;p95 frame time&quot;, number(m.p95FrameMs, &quot; ms&quot;)},
+        {&quot;Session memory&quot;, number(m.memoryMb, &quot; MB&quot;)}, {&quot;Instances&quot;, number(m.instances)},
+        {&quot;Memory baseline delta&quot;, number(memory.deltaMb, &quot; MB&quot;)}, {&quot;Observed growth&quot;, number(memory.growthMbPerMinute, &quot; MB/min&quot;)}} do
+        table.insert(lines, &quot;| &quot; .. pair[1] .. &quot; | &quot; .. pair[2] .. &quot; |&quot;)
+    end
+    table.insert(lines, &quot;\n## Static findings (advisory)\n&quot;)
+    table.insert(lines, &quot;| Severity | Location | Finding | Recommendation |\n| --- | --- | --- | --- |&quot;)
+    for _, finding in report.findings or {} do
+        table.insert(lines, &quot;| &quot; .. cell(finding.severity) .. &quot; | &quot; .. cell(finding.path) .. &quot;:&quot; .. tostring(finding.line or 1)
+            .. &quot; | &quot; .. cell(finding.title) .. &quot; | &quot; .. cell(finding.recommendation) .. &quot; |&quot;)
+    end
+    if #(report.findings or {}) == 0 then table.insert(lines, &quot;\nNo static findings in this report. Check coverage before drawing conclusions.&quot;) end
+    table.insert(lines, &quot;\n## CPU capture\n&quot;)
+    table.insert(lines, cell(report.cpu.status or &quot;idle&quot;) .. &quot;: &quot; .. cell(report.cpu.message or &quot;No capture recorded.&quot;))
+    table.insert(lines, &quot;\nInclusive sampled times overlap; do not sum rows as total CPU usage.\n&quot;)
+    table.insert(lines, &quot;| Function | Location | Inclusive ms | Session % |\n| --- | --- | --- | --- |&quot;)
+    for _, row in report.cpu.rows or {} do
+        table.insert(lines, &quot;| &quot; .. cell(row.name) .. &quot; | &quot; .. cell(row.path) .. &quot;:&quot; .. tostring(row.line or 1)
+            .. &quot; | &quot; .. number(row.durationMs) .. &quot; | &quot; .. number(row.percent, &quot;%&quot;) .. &quot; |&quot;)
+    end
+    table.insert(lines, &quot;\n## Limitations\n&quot;)
+    for _, limitation in report.limitations or {} do table.insert(lines, &quot;- &quot; .. limitation) end
+    return table.concat(lines, &quot;\n&quot;)
+end
+return Report
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticScanner"><Properties><string name="Name">Scanner</string><ProtectedString name="Source">--!strict
+local Lexer = require(script.Parent.Lexer)
+local Scanner = {}
+local frameSignals = {Heartbeat = true, RenderStepped = true, Stepped = true,
+    PreRender = true, PreSimulation = true, PostSimulation = true}
+local expressionPrefix = { [&quot;=&quot;] = true, [&quot;return&quot;] = true, [&quot;(&quot;] = true, [&quot;[&quot;] = true,
+    [&quot;{&quot;] = true, [&quot;,&quot;] = true, [&quot;+&quot;] = true, [&quot;-&quot;] = true, [&quot;*&quot;] = true,
+    [&quot;/&quot;] = true, [&quot;%&quot;] = true, [&quot;^&quot;] = true, [&quot;and&quot;] = true, [&quot;or&quot;] = true, [&quot;not&quot;] = true }
+
+function Scanner.scan(source: string, path: string, limit: number?)
+    local tokens = Lexer.tokens(source)
+    local findings, blocks, conditionalDepths = {}, {}, {}
+    local pendingLoop, pendingHot = false, false
+    local maxFindings = limit or 50
+    local function value(index) return if tokens[index] then tokens[index].value else &quot;&quot; end
+    local function active(kind)
+        for _, block in blocks do if block == kind then return true end end
+        return false
+    end
+    local function emit(rule, token, severity, title, explanation, recommendation)
+        if #findings &gt;= maxFindings then return end
+        table.insert(findings, {rule = rule, path = path, line = token.line,
+            severity = severity, confidence = &quot;medium&quot;, title = title,
+            evidence = &quot;Source pattern: &quot; .. token.value .. &quot; at line &quot; .. token.line,
+            explanation = explanation, recommendation = recommendation})
+    end
+    for i, token in tokens do
+        local word = token.value
+        if word == &quot;for&quot; or word == &quot;while&quot; then pendingLoop = true
+        elseif word == &quot;repeat&quot; then table.insert(blocks, &quot;loop&quot;)
+        elseif word == &quot;do&quot; then
+            table.insert(blocks, if pendingLoop then &quot;loop&quot; else &quot;block&quot;)
+            pendingLoop = false
+        elseif word == &quot;if&quot; then
+            -- Conditional expressions have no closing end and must not enter the block stack.
+            local previous = value(i - 1)
+            local expression = expressionPrefix[previous] or ((previous == &quot;then&quot; or previous == &quot;else&quot;) and conditionalDepths[#blocks])
+            if expression then conditionalDepths[#blocks] = true else table.insert(blocks, &quot;block&quot;) end
+        elseif word == &quot;function&quot; then
+            table.insert(blocks, if pendingHot then &quot;hot&quot; else &quot;function&quot;)
+            pendingHot = false
+        elseif word == &quot;end&quot; or word == &quot;until&quot; then
+            conditionalDepths[#blocks] = nil
+            table.remove(blocks)
+        end
+
+        if word == &quot;Connect&quot; and value(i - 1) == &quot;:&quot; and value(i + 1) == &quot;(&quot; then
+            if active(&quot;loop&quot;) then
+                emit(&quot;connection-loop&quot;, token, &quot;warning&quot;, &quot;Connection created inside a loop&quot;,
+                    &quot;Repeated execution may retain multiple listeners. This pattern is a lifecycle risk, not a count of live connections.&quot;,
+                    &quot;Connect once outside the loop, or retain each connection and disconnect it when its owner is destroyed.&quot;)
+            end
+            if frameSignals[value(i - 2)] then
+                local retained = false
+                for j = i - 1, 1, -1 do
+                    if tokens[j].line ~= token.line then break end
+                    if value(j) == &quot;=&quot; then retained = true; break end
+                end
+                if not retained then
+                    emit(&quot;frame-connection&quot;, token, &quot;info&quot;, &quot;Review frame connection ownership&quot;,
+                        &quot;A high-frequency signal connection is not visibly retained on this line. Cleanup may exist elsewhere.&quot;,
+                        &quot;Keep the connection in its owner&apos;s cleanup scope and disconnect it on teardown; avoid expensive work every frame.&quot;)
+                end
+                -- Only an immediately supplied function is attributed to this callback.
+                pendingHot = value(i + 2) == &quot;function&quot;
+            end
+        elseif (word == &quot;GetDescendants&quot; or word == &quot;GetChildren&quot;) and value(i - 1) == &quot;:&quot;
+            and value(i + 1) == &quot;(&quot; and (active(&quot;loop&quot;) or active(&quot;hot&quot;)) then
+            emit(&quot;traversal-hotpath&quot;, token, &quot;warning&quot;, &quot;Hierarchy traversal in repeated execution&quot;,
+                &quot;Repeated hierarchy enumeration allocates tables and revisits objects. Lexical context suggests a possible hot path; measure before changing it.&quot;,
+                &quot;Cache the needed objects, update the cache with descendant events, or move this traversal out of the repeated callback.&quot;)
+        elseif (word == &quot;wait&quot; or word == &quot;spawn&quot; or word == &quot;delay&quot;) and value(i + 1) == &quot;(&quot;
+            and value(i - 1) ~= &quot;.&quot; and value(i - 1) ~= &quot;:&quot; and value(i - 1) ~= &quot;function&quot; then
+            emit(&quot;legacy-scheduler&quot;, token, &quot;info&quot;, &quot;Legacy scheduling API&quot;,
+                &quot;This looks like a legacy global scheduler call. Locally shadowed names can produce a false positive.&quot;,
+                &quot;Use task.&quot; .. word .. &quot; and verify timing behavior. For recurring work, choose an explicit interval that fits the workload.&quot;)
+        end
+    end
+    return findings
+end
+
+return Scanner
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticStudio"><Properties><string name="Name">Studio</string><ProtectedString name="Source">--!strict
+local Scanner = require(script.Parent.Scanner)
+local Metrics = require(script.Parent.Metrics)
+local Capture = require(script.Parent.Capture)
+local Studio = {}
+Studio.__index = Studio
+
+local function safeNumber(callback)
+    local ok, result = pcall(callback)
+    return if ok and type(result) == &quot;number&quot; and result &gt;= 0 and result == result and result &lt; math.huge then result else nil
+end
+local limits = {scripts = 2000, source = 256 * 1024, findings = 500}
+local internalRoots = {CoreGui = true, CorePackages = true, PluginDebugService = true,
+    RobloxPluginGuiService = true, PluginGuiService = true}
+
+function Studio.projectRoots(children)
+    local roots = {}
+    for _, child in children do
+        if not internalRoots[child.Name] then table.insert(roots, child) end
+    end
+    return roots
+end
+
+function Studio.new(changed)
+    local self = setmetatable({changed = changed, alive = true, scanId = 0, scanning = false,
+        findings = {}, coverage = {scanned = 0}, notice = &quot;Ready. Scan your project to find optimization opportunities.&quot;,
+        metrics = Metrics.new(120), samplingGeneration = 0}, Studio)
+    self.run = game:GetService(&quot;RunService&quot;)
+    self.stats = game:GetService(&quot;Stats&quot;)
+    self.players = game:GetService(&quot;Players&quot;)
+    self.selection = game:GetService(&quot;Selection&quot;)
+    self.editor = game:GetService(&quot;ScriptEditorService&quot;)
+    self.http = game:GetService(&quot;HttpService&quot;)
+    local ok, profiler = pcall(function() return game:GetService(&quot;ScriptProfilerService&quot;) end)
+    local function available()
+        assert(ok and profiler, &quot;This Studio build does not expose ScriptProfilerService.&quot;)
+        return profiler
+    end
+    self.capture = Capture.new({
+        isRunning = function() return self.run:IsRunning() end,
+        timestamp = function() return DateTime.now().UnixTimestampMillis end,
+        localPlayer = function() return self.players.LocalPlayer end,
+        delay = function(seconds, callback) task.delay(seconds, callback) end,
+        subscribe = function(callback) return available().OnNewData:Connect(callback) end,
+        start = function(target, player)
+            if target == &quot;client&quot; then available():ClientStart(player, 1000) else available():ServerStart(1000) end
+        end,
+        stop = function(target, player)
+            if target == &quot;client&quot; then available():ClientStop(player) else available():ServerStop() end
+        end,
+        request = function(target, player)
+            if target == &quot;client&quot; then available():ClientRequestData(player) else available():ServerRequestData() end
+        end,
+        decode = function(raw)
+            assert(type(raw) == &quot;string&quot; and #raw &lt;= 16 * 1024 * 1024, &quot;Snapshot exceeds the 16 MiB safety limit or is not JSON.&quot;)
+            -- DeserializeJSON converts durations to seconds and removes Flags in Studio.
+            -- Keep the documented export schema (microseconds + flags) end to end.
+            return self.http:JSONDecode(raw)
+        end,
+    }, function() if self.alive then self.changed() end end)
+    self.runConnection = self.run:GetPropertyChangedSignal(&quot;RunState&quot;):Connect(function()
+        if not self.run:IsRunning() then self.capture:cancel() end
+        self.changed()
+    end)
+    return self
+end
+
+function Studio:context()
+    local side = if self.run:IsRunning() then &quot;Play&quot; else &quot;Edit&quot;
+    return side .. &quot; · current Studio session (includes editor/plugin overhead)&quot;
+end
+function Studio:sample()
+    local categories = {}
+    local trackingOk, tracking = pcall(function() return self.stats.MemoryTrackingEnabled end)
+    if trackingOk and tracking then
+        for _, name in {&quot;LuaHeap&quot;, &quot;Script&quot;, &quot;Signals&quot;, &quot;Instances&quot;, &quot;GraphicsTexture&quot;, &quot;PhysicsCollision&quot;} do
+            local value = safeNumber(function() return self.stats:GetMemoryUsageMbForTag(Enum.DeveloperMemoryTag[name]) end)
+            if value then categories[name] = value end
+        end
+    end
+    local frame = safeNumber(function() return self.stats.FrameTime end)
+    self.metrics:push({time = os.clock(), memoryMb = safeNumber(function() return self.stats:GetTotalMemoryUsageMb() end),
+        frameMs = if frame and frame &gt; 0 then frame * 1000 else nil,
+        heartbeatMs = safeNumber(function() return self.stats.HeartbeatTime * 1000 end),
+        physicsMs = safeNumber(function() return self.stats.PhysicsStepTime * 1000 end),
+        instances = safeNumber(function() return self.stats.InstanceCount end), categories = categories})
+end
+function Studio:setSampling(enabled)
+    self.samplingGeneration += 1
+    if not enabled or not self.alive then return end
+    local generation = self.samplingGeneration
+    task.spawn(function()
+        while self.alive and generation == self.samplingGeneration do
+            self:sample(); self.changed(); task.wait(0.5)
+        end
+    end)
+end
+function Studio:cancelScan()
+    if not self.scanning then return end
+    self.scanId += 1; self.scanning = false; self.coverage.cancelled = true
+    self.notice = &quot;Scan cancelled. Findings and coverage are partial.&quot;; self.changed()
+end
+function Studio:scan(scope)
+    if self.scanning or not self.alive then return end
+    self.scanId += 1
+    local scanId = self.scanId
+    local roots = if scope == &quot;selection&quot; then self.selection:Get() else Studio.projectRoots(game:GetChildren())
+    if #roots == 0 then self.notice = &quot;Select scripts or a container in Explorer before scanning the selection.&quot;; self.changed(); return end
+    self.scanning = true; self.findings = {}
+    local coverage = {scope = scope, scanned = 0, unreadable = 0, skipped = 0, candidates = 0, truncated = false,
+        sourceLimitBytes = limits.source, scriptLimit = limits.scripts, findingLimit = limits.findings,
+        scanContext = self:context(), scannedAt = DateTime.now():ToIsoDate()}
+    self.coverage = coverage
+    self.notice = &quot;Scanning source locally…&quot;; self.changed()
+    task.spawn(function()
+        -- Incremental traversal avoids materializing all descendants for a large place.
+        local stack, seen, visited = table.clone(roots), {}, 0
+        while #stack &gt; 0 and self.alive and self.scanId == scanId do
+            local instance = table.remove(stack)
+            if seen[instance] then continue end
+            seen[instance] = true; visited += 1
+            local childrenOk, children = pcall(function() return instance:GetChildren() end)
+            if childrenOk then
+                for _, child in children do table.insert(stack, child) end
+            end
+            if instance:IsA(&quot;LuaSourceContainer&quot;) then
+                coverage.candidates += 1
+                if coverage.scanned + coverage.unreadable + coverage.skipped &gt;= limits.scripts then
+                    coverage.truncated = true; break
+                end
+                local sourceOk, source = pcall(function() return self.editor:GetEditorSource(instance) end)
+                if not sourceOk then sourceOk, source = pcall(function() return instance.Source end) end
+                if not sourceOk or type(source) ~= &quot;string&quot; then coverage.unreadable += 1
+                elseif #source &gt; limits.source then coverage.skipped += 1
+                else
+                    coverage.scanned += 1
+                    local path = instance:GetFullName()
+                    local remaining = limits.findings - #self.findings
+                    local results = Scanner.scan(source, path, math.min(51, remaining + 1))
+                    for _, finding in results do
+                        if #self.findings &gt;= limits.findings then coverage.truncated = true; break end
+                        finding.instance = instance
+                        table.insert(self.findings, finding)
+                    end
+                    if #results &gt; 50 then coverage.truncated = true end
+                    if #self.findings &gt;= limits.findings then coverage.truncated = true; break end
+                end
+            end
+            if visited % 20 == 0 then
+                self.notice = string.format(&quot;Scanning… %d scripts checked · %d findings&quot;, coverage.scanned, #self.findings)
+                self.changed(); task.wait()
+            end
+        end
+        if not self.alive or self.scanId ~= scanId then return end
+        self.scanning = false
+        self.notice = string.format(&quot;Scan complete · %d scripts · %d advisory findings%s&quot;, coverage.scanned, #self.findings,
+            if coverage.truncated or coverage.skipped &gt; 0 or coverage.unreadable &gt; 0 then &quot; · partial coverage&quot; else &quot;&quot;)
+        self.changed()
+    end)
+end
+function Studio:open(finding)
+    local instance = finding.instance
+    if not instance or not instance.Parent then
+        -- A CPU source is a display path, not an executable expression.
+        local current = game
+        for segment in string.gmatch(finding.path or &quot;&quot;, &quot;[^%.]+&quot;) do
+            if current == game and segment == &quot;game&quot; then continue end
+            current = current:FindFirstChild(segment)
+            if not current then break end
+        end
+        instance = current
+    end
+    if not instance or not instance:IsA(&quot;LuaSourceContainer&quot;) then
+        self.notice = &quot;That script is unavailable in this DataModel. CPU source names may refer to another Play context.&quot;
+        self.changed(); return
+    end
+    task.spawn(function()
+        local ok, problem = pcall(function()
+            local opened, message = self.editor:OpenScriptDocumentAsync(instance)
+            assert(opened, tostring(message))
+            local document = self.editor:FindScriptDocument(instance)
+            if document then document:RequestSetSelectionAsync(math.max(1, finding.line or 1), 1) end
+            self.selection:Set({instance})
+        end)
+        if not ok and self.alive then self.notice = &quot;Could not open source: &quot; .. tostring(problem); self.changed() end
+    end)
+end
+function Studio:destroy()
+    self.alive = false; self.scanId += 1; self.samplingGeneration += 1
+    self.capture:destroy()
+    if self.runConnection then self.runConnection:Disconnect() end
+    self.changed = function() end
+end
+return Studio
+</ProtectedString></Properties></Item><Item class="ModuleScript" referent="OpticUI"><Properties><string name="Name">UI</string><ProtectedString name="Source">--!strict
+local Brand = require(script.Parent.Brand)
+local UI = {}
+UI.__index = UI
+
+local C = {
+    background = Color3.fromRGB(23, 24, 30),
+    panel = Color3.fromRGB(31, 33, 41),
+    raised = Color3.fromRGB(40, 42, 53),
+    hover = Color3.fromRGB(49, 51, 64),
+    border = Color3.fromRGB(54, 57, 70),
+    text = Color3.fromRGB(241, 242, 247),
+    muted = Color3.fromRGB(184, 188, 203),
+    quiet = Color3.fromRGB(149, 155, 175),
+    accent = Color3.fromRGB(192, 172, 255),
+    accentFill = Color3.fromRGB(57, 47, 80),
+    accentHover = Color3.fromRGB(208, 193, 255),
+    green = Color3.fromRGB(149, 212, 182),
+    warning = Color3.fromRGB(237, 196, 135),
+    warningFill = Color3.fromRGB(62, 49, 36),
+}
+local F = {body = Enum.Font.BuilderSans, medium = Enum.Font.BuilderSansMedium,
+    bold = Enum.Font.BuilderSansBold, mono = Enum.Font.RobotoMono}
+local tabNames = {&quot;Overview&quot;, &quot;Findings&quot;, &quot;CPU&quot;, &quot;Memory&quot;, &quot;Report&quot;}
+
+local function make(class, properties, parent)
+    local object = Instance.new(class)
+    for name, value in properties do object[name] = value end
+    object.Parent = parent
+    return object
+end
+local function round(object, radius)
+    make(&quot;UICorner&quot;, {CornerRadius = UDim.new(0, radius or 12)}, object)
+end
+local function inset(object, amount)
+    make(&quot;UIPadding&quot;, {PaddingLeft = UDim.new(0, amount), PaddingRight = UDim.new(0, amount),
+        PaddingTop = UDim.new(0, amount), PaddingBottom = UDim.new(0, amount)}, object)
+end
+local function stack(object, gap)
+    make(&quot;UIListLayout&quot;, {Padding = UDim.new(0, gap or 12), SortOrder = Enum.SortOrder.LayoutOrder}, object)
+end
+local function outline(object, color)
+    return make(&quot;UIStroke&quot;, {Color = color or C.border, Thickness = 1, Transparency = 0.35,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, object)
+end
+local function label(parent, text, height, color, size, font)
+    return make(&quot;TextLabel&quot;, {BackgroundTransparency = 1, Text = text, TextColor3 = color or C.text,
+        TextSize = size or 15, Font = font or F.body, TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, RichText = false,
+        Size = UDim2.new(1, 0, 0, height or 0),
+        AutomaticSize = if height then Enum.AutomaticSize.None else Enum.AutomaticSize.Y}, parent)
+end
+local function surface(parent, height, color)
+    local frame = make(&quot;Frame&quot;, {BackgroundColor3 = color or C.panel, BorderSizePixel = 0,
+        Size = UDim2.new(1, -6, 0, height or 0),
+        AutomaticSize = if height then Enum.AutomaticSize.None else Enum.AutomaticSize.Y}, parent)
+    round(frame); inset(frame, 18)
+    if not height then stack(frame, 10) end
+    return frame
+end
+local function paintButton(object, hovered, pressed, focused)
+    local tone = object:GetAttribute(&quot;Tone&quot;)
+    local selected = object:GetAttribute(&quot;Selected&quot;) == true
+    if tone == &quot;primary&quot; then
+        object.BackgroundColor3 = if pressed then C.accent elseif hovered then C.accentHover else C.accent
+        object.TextColor3 = C.background
+    elseif tone == &quot;tab&quot; then
+        object.BackgroundColor3 = if selected then C.raised elseif hovered then C.hover else C.panel
+        object.TextColor3 = if selected then C.text else C.muted
+    else
+        object.BackgroundColor3 = if pressed then C.hover elseif hovered then C.hover else C.raised
+        object.TextColor3 = C.text
+    end
+    local stroke = object:FindFirstChildOfClass(&quot;UIStroke&quot;)
+    if stroke then
+        stroke.Color = if focused then C.accent else C.border
+        stroke.Transparency = if focused then 0 else 0.5
+    end
+end
+local function button(parent, text, width, callback, connections, tone)
+    local object = make(&quot;TextButton&quot;, {Text = text, Size = UDim2.fromOffset(width or 120, 38),
+        BackgroundColor3 = C.raised, BorderSizePixel = 0, TextColor3 = C.text,
+        TextSize = 14, Font = F.medium, AutoButtonColor = false, Selectable = true}, parent)
+    round(object, 9); outline(object)
+    object:SetAttribute(&quot;Tone&quot;, tone or &quot;secondary&quot;)
+    local hovered, pressed, focused = false, false, false
+    local function paint() paintButton(object, hovered, pressed, focused) end
+    local function connect(signal, callback) table.insert(connections, signal:Connect(callback)) end
+    connect(object.Activated, callback)
+    connect(object.MouseEnter, function() hovered = true; paint() end)
+    connect(object.MouseLeave, function() hovered = false; pressed = false; paint() end)
+    connect(object.MouseButton1Down, function() pressed = true; paint() end)
+    connect(object.MouseButton1Up, function() pressed = false; paint() end)
+    connect(object.SelectionGained, function() focused = true; paint() end)
+    connect(object.SelectionLost, function() focused = false; paint() end)
+    connect(object:GetAttributeChangedSignal(&quot;Selected&quot;), paint)
+    paint()
+    return object
+end
+local function numeric(value, suffix, decimals)
+    return if type(value) == &quot;number&quot; then string.format(&quot;%.&quot; .. tostring(decimals or 1) .. &quot;f%s&quot;, value, suffix or &quot;&quot;) else &quot;Unavailable&quot;
+end
+local function signed(value, suffix)
+    return if type(value) == &quot;number&quot; then string.format(&quot;%+.1f%s&quot;, value, suffix or &quot;&quot;) else &quot;No baseline&quot;
+end
+local function section(parent, title, description)
+    local frame = make(&quot;Frame&quot;, {BackgroundTransparency = 1, Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y}, parent)
+    stack(frame, 5)
+    label(frame, title, nil, C.text, 20, F.bold)
+    if description then label(frame, description, nil, C.muted, 14) end
+    return frame
+end
+
+function UI.new(widget, actions)
+    local self = setmetatable({widget = widget, actions = actions, connections = {}, pageConnections = {},
+        pages = {}, tabs = {}, dynamic = {}, current = &quot;Overview&quot;, search = &quot;&quot;, severity = &quot;all&quot;,
+        reportPage = 1, reportChunks = {&quot;Your report will appear here. Choose a format, then select Generate report.&quot;}}, UI)
+    self.root = make(&quot;Frame&quot;, {Name = &quot;Optic&quot;, Size = UDim2.fromScale(1, 1), BackgroundColor3 = C.background, BorderSizePixel = 0}, widget)
+    local header = make(&quot;Frame&quot;, {Name = &quot;Header&quot;, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(20, 14), Size = UDim2.new(1, -40, 0, 58)}, self.root)
+    self.logo = make(&quot;ImageLabel&quot;, {Name = &quot;BrandLogo&quot;, BackgroundTransparency = 1, Image = Brand.Logo,
+        ScaleType = Enum.ScaleType.Fit, Size = UDim2.fromOffset(56, 56)}, header)
+    local name = label(header, &quot;Optic&quot;, 34, C.text, 30, F.bold)
+    name.Position = UDim2.fromOffset(68, 0); name.Size = UDim2.new(1, -210, 0, 36)
+    local subtitle = label(header, &quot;Roblox performance profiler&quot;, 20, C.muted, 14)
+    subtitle.Position = UDim2.fromOffset(69, 37); subtitle.Size = UDim2.new(1, -72, 0, 20)
+    local badge = make(&quot;Frame&quot;, {Name = &quot;Context&quot;, BackgroundColor3 = C.panel, BorderSizePixel = 0,
+        AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 4), Size = UDim2.fromOffset(122, 29)}, header)
+    round(badge, 14)
+    local dot = make(&quot;Frame&quot;, {BackgroundColor3 = C.green, BorderSizePixel = 0, Position = UDim2.fromOffset(12, 11), Size = UDim2.fromOffset(7, 7)}, badge)
+    round(dot, 4)
+    self.contextLabel = label(badge, &quot;Live · Studio&quot;, 20, C.muted, 13, F.medium)
+    self.contextLabel.Position = UDim2.fromOffset(26, 5); self.contextLabel.Size = UDim2.new(1, -30, 0, 20)
+
+    local controls = make(&quot;Frame&quot;, {Name = &quot;Actions&quot;, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(20, 88), Size = UDim2.new(1, -40, 0, 38)}, self.root)
+    make(&quot;UIListLayout&quot;, {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder}, controls)
+    self.scopeButton = button(controls, &quot;Project&quot;, 100, function() actions.scope() end, self.connections)
+    self.scanButton = button(controls, &quot;Scan project&quot;, 130, function() actions.scan() end, self.connections, &quot;primary&quot;)
+    self.captureButton = button(controls, &quot;Record CPU&quot;, 130, function() self:switch(&quot;CPU&quot;); actions.capture() end, self.connections)
+    self.baselineButton = button(controls, &quot;Baseline&quot;, 100, function() actions.baseline() end, self.connections)
+    for index, control in {self.scopeButton, self.scanButton, self.captureButton, self.baselineButton} do
+        control.Size = UDim2.new(({0.22, 0.28, 0.28, 0.22})[index], -7.5, 0, 38)
+    end
+
+    local tabs = make(&quot;Frame&quot;, {Name = &quot;Navigation&quot;, BackgroundColor3 = C.panel, BorderSizePixel = 0,
+        Position = UDim2.fromOffset(20, 140), Size = UDim2.new(1, -40, 0, 42)}, self.root)
+    round(tabs, 11)
+    for index, tabName in tabNames do
+        local tab = button(tabs, tabName, 80, function() self:switch(tabName) end, self.connections, &quot;tab&quot;)
+        tab.Position = UDim2.new((index - 1) / 5, 4, 0, 4)
+        tab.Size = UDim2.new(1 / 5, -8, 1, -8)
+        local stroke = tab:FindFirstChildOfClass(&quot;UIStroke&quot;)
+        if stroke then stroke.Enabled = false end
+        self.tabs[tabName] = tab
+    end
+    self.notice = label(self.root, &quot;Ready when you are. Start with a project scan.&quot;, 30, C.muted, 13)
+    self.notice.Name = &quot;Status&quot;
+    self.notice.Position = UDim2.fromOffset(20, 194); self.notice.Size = UDim2.new(1, -40, 0, 30)
+    self.body = make(&quot;Frame&quot;, {Name = &quot;Content&quot;, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(20, 236), Size = UDim2.new(1, -40, 1, -254)}, self.root)
+    for _, tabName in tabNames do
+        local page = make(&quot;ScrollingFrame&quot;, {Name = tabName, BackgroundTransparency = 1, BorderSizePixel = 0,
+            Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            ScrollBarThickness = 4, ScrollBarImageColor3 = C.border, ScrollingDirection = Enum.ScrollingDirection.Y,
+            Visible = tabName == &quot;Overview&quot;}, self.body)
+        stack(page, 14); self.pages[tabName] = page; self.pageConnections[tabName] = {}
+    end
+    self:_overview(); self:_findingsControls(); self:_cpuControls(); self:_memoryControls(); self:_reportControls()
+    table.insert(self.connections, self.root:GetPropertyChangedSignal(&quot;AbsoluteSize&quot;):Connect(function() self:_layout() end))
+    table.insert(self.connections, self.notice:GetPropertyChangedSignal(&quot;TextBounds&quot;):Connect(function() self:_layout() end))
+    self:_layout(); self:switch(&quot;Overview&quot;)
+    return self
+end
+
+function UI:_layout()
+    local width = self.root.AbsoluteSize.X
+    local noticeHeight = math.clamp(self.notice.TextBounds.Y + 4, 24, 68)
+    self.notice.Size = UDim2.new(1, -40, 0, noticeHeight)
+    local top = 194 + noticeHeight + 14
+    self.body.Position = UDim2.fromOffset(20, top)
+    self.body.Size = UDim2.new(1, -40, 0, math.max(48, self.root.AbsoluteSize.Y - top - 18))
+    if not self.metricGrid then return end
+    local columns = if width &gt;= 680 then 4 else 2
+    self.metricGrid.Size = UDim2.new(1, -6, 0, if columns == 4 then 112 else 236)
+    for index, tile in self.metricTiles do
+        local column = (index - 1) % columns
+        tile.Position = UDim2.new(column / columns, column * 12 / columns, 0, math.floor((index - 1) / columns) * 124)
+        tile.Size = UDim2.new(1 / columns, -(columns - 1) * 12 / columns, 0, 112)
+    end
+end
+
+function UI:switch(name)
+    self.current = name
+    for pageName, page in self.pages do
+        page.Visible = pageName == name
+        self.tabs[pageName]:SetAttribute(&quot;Selected&quot;, pageName == name)
+    end
+    if self.state then self:render(self.state) end
+end
+function UI:_clear(name)
+    for _, connection in self.pageConnections[name] do connection:Disconnect() end
+    self.pageConnections[name] = {}
+    local parent = self.dynamic[name] or self.pages[name]
+    for _, child in parent:GetChildren() do if child:IsA(&quot;GuiObject&quot;) then child:Destroy() end end
+end
+function UI:_dynamic(name)
+    local frame = make(&quot;Frame&quot;, {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y}, self.pages[name])
+    stack(frame, 12); self.dynamic[name] = frame
+    return frame
+end
+
+function UI:_overview()
+    self.metricValues, self.metricHints, self.metricTiles = {}, {}, {}
+    self.metricGrid = make(&quot;Frame&quot;, {Name = &quot;MetricGrid&quot;, BackgroundTransparency = 1, Size = UDim2.new(1, -6, 0, 112)}, self.pages.Overview)
+    for _, item in {{&quot;frameMs&quot;, &quot;Frame time&quot;, &quot;Sampled mean&quot;}, {&quot;memoryMb&quot;, &quot;Memory&quot;, &quot;Studio session&quot;},
+        {&quot;instances&quot;, &quot;Instances&quot;, &quot;Objects in memory&quot;}, {&quot;findings&quot;, &quot;Findings&quot;, &quot;Source suggestions&quot;}} do
+        local tile = make(&quot;Frame&quot;, {Name = item[1], BackgroundColor3 = C.panel, BorderSizePixel = 0, Size = UDim2.fromOffset(160, 112)}, self.metricGrid)
+        round(tile); inset(tile, 16)
+        label(tile, item[2], 18, C.muted, 14, F.medium)
+        local value = label(tile, &quot;—&quot;, 36, C.text, 28, F.medium)
+        value.Position = UDim2.fromOffset(0, 25)
+        local hint = label(tile, item[3], 19, C.quiet, 13)
+        hint.Position = UDim2.fromOffset(0, 64)
+        self.metricValues[item[1]] = value; self.metricHints[item[1]] = hint
+        table.insert(self.metricTiles, tile)
+    end
+    local chart = surface(self.pages.Overview, 186)
+    label(chart, &quot;Frame history&quot;, 22, C.text, 17, F.medium)
+    self.chartSummary = label(chart, &quot;Waiting for samples&quot;, 20, C.muted, 13)
+    self.chartSummary.Position = UDim2.fromOffset(0, 29)
+    self.graph = make(&quot;Frame&quot;, {BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 60), Size = UDim2.new(1, 0, 0, 68)}, chart)
+    for index = 1, 3 do
+        make(&quot;Frame&quot;, {BackgroundColor3 = C.border, BackgroundTransparency = 0.5, BorderSizePixel = 0,
+            Position = UDim2.new(0, 0, index / 3, 0), Size = UDim2.new(1, 0, 0, 1)}, self.graph)
+    end
+    self.bars = {}
+    for index = 1, 60 do
+        local bar = make(&quot;Frame&quot;, {BorderSizePixel = 0, BackgroundColor3 = C.accent, BackgroundTransparency = 0.23,
+            AnchorPoint = Vector2.new(0, 1), Position = UDim2.new((index - 1) / 60, 0, 1, 0),
+            Size = UDim2.new(1 / 60, -3, 0, 0)}, self.graph)
+        round(bar, 2); self.bars[index] = bar
+    end
+    self.graphNote = label(chart, &quot;0.5s samples · Studio may slow frames when unfocused.&quot;, 20, C.quiet, 13)
+    self.graphNote.Position = UDim2.fromOffset(0, 137)
+    local guide = surface(self.pages.Overview)
+    label(guide, &quot;A good place to start&quot;, nil, C.text, 17, F.medium)
+    label(guide, &quot;Scan your scripts, record a slow moment, then compare memory to a baseline.&quot;, nil, C.muted, 15)
+    label(guide, &quot;Metrics include Studio and plugin activity. Source findings are suggestions to investigate.&quot;, nil, C.quiet, 13)
+end
+
+function UI:_findingsControls()
+    section(self.pages.Findings, &quot;Small changes. Smoother games.&quot;, &quot;Review source patterns, then open a script to take a closer look.&quot;)
+    self.searchBox = make(&quot;TextBox&quot;, {Name = &quot;Search&quot;, PlaceholderText = &quot;Search scripts or suggestions…&quot;, Text = &quot;&quot;, ClearTextOnFocus = false,
+        Size = UDim2.new(1, -6, 0, 42), BackgroundColor3 = C.panel, BorderSizePixel = 0,
+        TextColor3 = C.text, PlaceholderColor3 = C.quiet, Font = F.body, TextSize = 15,
+        TextXAlignment = Enum.TextXAlignment.Left}, self.pages.Findings)
+    round(self.searchBox, 10); inset(self.searchBox, 12); outline(self.searchBox)
+    table.insert(self.connections, self.searchBox:GetPropertyChangedSignal(&quot;Text&quot;):Connect(function()
+        self.search = string.lower(self.searchBox.Text); self.lastFindings = nil
+        if self.state then self:render(self.state) end
+    end))
+    local row = make(&quot;Frame&quot;, {BackgroundTransparency = 1, Size = UDim2.new(1, -6, 0, 38)}, self.pages.Findings)
+    self.filterButton = button(row, &quot;All severities&quot;, 136, function()
+        self.severity = if self.severity == &quot;all&quot; then &quot;warning&quot; elseif self.severity == &quot;warning&quot; then &quot;info&quot; else &quot;all&quot;
+        self.filterButton.Text = if self.severity == &quot;all&quot; then &quot;All severities&quot; elseif self.severity == &quot;warning&quot; then &quot;Warnings&quot; else &quot;Information&quot;
+        self.lastFindings = nil
+        if self.state then self:render(self.state) end
+    end, self.connections)
+    self.findingCount = label(row, &quot;No scan yet&quot;, 36, C.muted, 13)
+    self.findingCount.Position = UDim2.fromOffset(150, 9); self.findingCount.Size = UDim2.new(1, -150, 0, 30)
+    self.coverageLabel = label(self.pages.Findings, &quot;Scan your project to see its coverage.&quot;, nil, C.quiet, 13)
+    self:_dynamic(&quot;Findings&quot;)
+end
+function UI:_renderFindings(state)
+    local coverage = state.coverage
+    local revision = #state.findings + (coverage.scanned or 0) + (coverage.unreadable or 0) + (coverage.skipped or 0)
+    if self.lastFindings == state.findings and self.lastScanning == state.scanning and self.lastFindingRevision == revision then return end
+    self.lastFindings = state.findings; self.lastScanning = state.scanning; self.lastFindingRevision = revision
+    self:_clear(&quot;Findings&quot;)
+    local matched, shown = 0, 0
+    for _, finding in state.findings do
+        local haystack = string.lower(finding.path .. &quot; &quot; .. finding.title .. &quot; &quot; .. finding.rule .. &quot; &quot; .. finding.recommendation)
+        if self.severity ~= &quot;all&quot; and finding.severity ~= self.severity then continue end
+        if self.search ~= &quot;&quot; and not string.find(haystack, self.search, 1, true) then continue end
+        matched += 1
+        if shown &gt;= 100 then continue end
+        shown += 1
+        local tile = surface(self.dynamic.Findings)
+        local badge = make(&quot;Frame&quot;, {BackgroundColor3 = if finding.severity == &quot;warning&quot; then C.warningFill else C.accentFill,
+            BorderSizePixel = 0, Size = UDim2.fromOffset(92, 26)}, tile)
+        round(badge, 7)
+        local badgeText = label(badge, if finding.severity == &quot;warning&quot; then &quot;Review&quot; else &quot;Suggestion&quot;, 20,
+            if finding.severity == &quot;warning&quot; then C.warning else C.accent, 13, F.medium)
+        badgeText.Position = UDim2.fromOffset(10, 4); badgeText.Size = UDim2.new(1, -20, 0, 20)
+        label(tile, finding.title, nil, C.text, 18, F.medium)
+        label(tile, finding.path .. &quot;:&quot; .. finding.line, nil, C.muted, 13, F.mono)
+        label(tile, finding.explanation, nil, C.muted, 15)
+        local recommendation = surface(tile, nil, C.raised)
+        label(recommendation, &quot;Suggested improvement&quot;, nil, C.accent, 13, F.medium)
+        label(recommendation, finding.recommendation, nil, C.text, 15)
+        label(tile, finding.evidence .. &quot; · &quot; .. finding.confidence .. &quot; confidence&quot;, nil, C.quiet, 13)
+        button(tile, &quot;Open script ↗&quot;, 132, function() self.actions.open(finding) end, self.pageConnections.Findings)
+    end
+    self.findingCount.Text = string.format(&quot;%d shown · %d matching&quot;, shown, matched)
+    self.coverageLabel.Text = string.format(&quot;%d scripts read · %d unreadable · %d skipped%s&quot;, coverage.scanned or 0,
+        coverage.unreadable or 0, coverage.skipped or 0, if coverage.truncated or coverage.cancelled then &quot; · partial coverage&quot; else &quot;&quot;)
+    if matched == 0 then
+        local tile = surface(self.dynamic.Findings)
+        label(tile, if state.scanning then &quot;Looking through your scripts…&quot; else &quot;Nothing to review here yet&quot;, nil, C.text, 18, F.medium)
+        label(tile, if self.search ~= &quot;&quot; or self.severity ~= &quot;all&quot; then &quot;Try another search or show all severities.&quot;
+            else &quot;Start a scan to check common patterns. A clear scan covers these checks only; CPU and memory can tell you more.&quot;, nil, C.muted, 15)
+    end
+end
+
+function UI:_cpuControls()
+    section(self.pages.CPU, &quot;Find your most expensive work&quot;, &quot;Record while reproducing the part of your game that feels slow.&quot;)
+    local intro = surface(self.pages.CPU)
+    label(intro, &quot;Start Play, then record&quot;, nil, C.text, 17, F.medium)
+    label(intro, &quot;Choose a target below. A recording runs for up to 15 seconds, or you can stop it early.&quot;, nil, C.muted, 15)
+    self.targetButton = button(intro, &quot;Client&quot;, 148, function() self.actions.target() end, self.connections)
+    self.cpuStatus = label(self.pages.CPU, &quot;Ready for your first capture.&quot;, nil, C.accent, 14)
+    label(self.pages.CPU, &quot;Times are sampled and inclusive. Functions can overlap, so their costs do not add up to total CPU usage.&quot;, nil, C.quiet, 13)
+    self:_dynamic(&quot;CPU&quot;)
+end
+function UI:_renderCPU(state)
+    self.targetButton.Text = if state.target == &quot;client&quot; then &quot;Target: Client&quot; else &quot;Target: Server&quot;
+    self.cpuStatus.Text = state.cpu.message or &quot;Ready for your first capture.&quot;
+    if self.lastCPU == state.cpu.rows then return end
+    self.lastCPU = state.cpu.rows; self:_clear(&quot;CPU&quot;)
+    for index, row in state.cpu.rows or {} do
+        local tile = surface(self.dynamic.CPU)
+        label(tile, string.format(&quot;%02d   %s&quot;, index, row.name), nil, C.text, 17, F.medium)
+        label(tile, numeric(row.durationMs, &quot; ms&quot;) .. &quot;  ·  &quot; .. numeric(row.percent, &quot;% of session&quot;), nil, C.accent, 20, F.medium)
+        label(tile, row.path .. &quot;:&quot; .. tostring(row.line or &quot;?&quot;), nil, C.muted, 13, F.mono)
+        button(tile, &quot;Open source ↗&quot;, 132, function() self.actions.open(row) end, self.pageConnections.CPU)
+    end
+    if #(state.cpu.rows or {}) == 0 then
+        local tile = surface(self.dynamic.CPU)
+        label(tile, &quot;Your capture results will appear here&quot;, nil, C.text, 18, F.medium)
+        label(tile, &quot;Start a Play test and select Record CPU. If profiling is unavailable, its status will explain why.&quot;, nil, C.muted, 15)
+    end
+end
+
+function UI:_memoryControls()
+    section(self.pages.Memory, &quot;Give memory a little context&quot;, &quot;Take a baseline before your workload, then compare what changes.&quot;)
+    local summary = surface(self.pages.Memory)
+    label(summary, &quot;Studio session memory&quot;, nil, C.muted, 14, F.medium)
+    self.memoryTotal = label(summary, &quot;Unavailable&quot;, nil, C.text, 30, F.medium)
+    self.memoryDelta = label(summary, &quot;Set a baseline to compare changes.&quot;, nil, C.accent, 15)
+    self.memoryBaseline = label(summary, &quot;&quot;, nil, C.muted, 14)
+    local trend = surface(self.pages.Memory)
+    label(trend, &quot;Observed trend&quot;, nil, C.text, 17, F.medium)
+    self.memoryTrend = label(trend, &quot;Gathering observations…&quot;, nil, C.muted, 15)
+    label(trend, &quot;Growth can come from loading, caching, garbage collection or Studio. It is a signal to investigate, not proof of a leak. Trends need 10 samples spanning 10 seconds.&quot;, nil, C.quiet, 13)
+    local categories = surface(self.pages.Memory)
+    label(categories, &quot;Where memory is tracked&quot;, nil, C.text, 17, F.medium)
+    self.categoryRows, self.categoryValues, self.categoryDeltas = {}, {}, {}
+    for _, name in {&quot;LuaHeap&quot;, &quot;Script&quot;, &quot;Signals&quot;, &quot;Instances&quot;, &quot;GraphicsTexture&quot;, &quot;PhysicsCollision&quot;} do
+        local row = make(&quot;Frame&quot;, {Name = name, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 30)}, categories)
+        local title = label(row, name, 28, C.muted, 14)
+        title.Size = UDim2.new(0.43, 0, 1, 0)
+        local value = label(row, &quot;Unavailable&quot;, 28, C.text, 14, F.medium)
+        value.Position = UDim2.fromScale(0.44, 0); value.Size = UDim2.new(0.28, 0, 1, 0)
+        local delta = label(row, &quot;—&quot;, 28, C.quiet, 13)
+        delta.Position = UDim2.fromScale(0.74, 0); delta.Size = UDim2.new(0.26, 0, 1, 0)
+        self.categoryRows[name] = row; self.categoryValues[name] = value; self.categoryDeltas[name] = delta
+    end
+    label(categories, &quot;Categories use different accounting from process memory and are not expected to add up.&quot;, nil, C.quiet, 13)
+end
+function UI:_renderMemory(state)
+    local memory = state.memory
+    self.memoryTotal.Text = numeric(memory.totalMb, &quot; MB&quot;)
+    self.memoryDelta.Text = if memory.hasBaseline then signed(memory.deltaMb, &quot; MB since baseline&quot;) else &quot;Select Baseline above to start a comparison.&quot;
+    self.memoryBaseline.Text = if memory.hasBaseline then &quot;Baseline · &quot; .. numeric(memory.baselineMb, &quot; MB&quot;) else &quot;No baseline captured yet.&quot;
+    self.memoryTrend.Text = if memory.growthMbPerMinute then numeric(memory.growthMbPerMinute, &quot; MB/min observed growth&quot;)
+        .. &quot; over &quot; .. numeric(memory.observationSeconds, &quot; seconds&quot;) else &quot;No sustained positive growth signal in the available observations.&quot;
+    self.memoryTrend.TextColor3 = if memory.growthMbPerMinute then C.warning else C.muted
+    for name, value in self.categoryValues do
+        value.Text = numeric(memory.categories[name], &quot; MB&quot;)
+        self.categoryDeltas[name].Text = if memory.categoryDeltas[name] then signed(memory.categoryDeltas[name], &quot; MB&quot;) else &quot;—&quot;
+    end
+end
+
+function UI:_reportControls()
+    section(self.pages.Report, &quot;Keep a useful snapshot&quot;, &quot;Save what you found, with enough context to act on it later.&quot;)
+    local intro = surface(self.pages.Report)
+    label(intro, &quot;Choose a format&quot;, nil, C.text, 17, F.medium)
+    label(intro, &quot;Generate a frozen report, then copy its text into a local file. Your script source is excluded.&quot;, nil, C.muted, 15)
+    local row = make(&quot;Frame&quot;, {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 38)}, intro)
+    self.formatButton = button(row, &quot;JSON&quot;, 116, function() self.actions.format() end, self.connections)
+    self.formatButton.Size = UDim2.new(0.4, -6, 0, 38)
+    local generate = button(row, &quot;Generate report&quot;, 160, function() self.actions.report() end, self.connections, &quot;primary&quot;)
+    generate.Position = UDim2.new(0.4, 6, 0, 0); generate.Size = UDim2.new(0.6, -6, 0, 38)
+    label(intro, &quot;Large reports use multiple pages. Copy each page in order without adding characters between them.&quot;, nil, C.quiet, 13)
+    local navigation = make(&quot;Frame&quot;, {BackgroundTransparency = 1, Size = UDim2.new(1, -6, 0, 38)}, self.pages.Report)
+    button(navigation, &quot;Previous&quot;, 84, function() self:_showReportPage(self.reportPage - 1) end, self.connections)
+    button(navigation, &quot;Next&quot;, 64, function() self:_showReportPage(self.reportPage + 1) end, self.connections).Position = UDim2.fromOffset(92, 0)
+    button(navigation, &quot;Select text&quot;, 96, function()
+        self.reportBox:CaptureFocus(); self.reportBox.CursorPosition = 1; self.reportBox.SelectionStart = #self.reportBox.Text + 1
+    end, self.connections).Position = UDim2.fromOffset(164, 0)
+    self.reportPageLabel = label(navigation, &quot;1 / 1&quot;, 25, C.muted, 13)
+    self.reportPageLabel.Position = UDim2.fromOffset(272, 10); self.reportPageLabel.Size = UDim2.new(1, -272, 0, 25)
+    self.reportBox = make(&quot;TextBox&quot;, {Name = &quot;ReportText&quot;, Text = self.reportChunks[1], TextEditable = false, MultiLine = true,
+        ClearTextOnFocus = false, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+        BackgroundColor3 = C.panel, BorderSizePixel = 0, TextColor3 = C.text, Font = F.mono, TextSize = 14,
+        Size = UDim2.new(1, -6, 0, 260), AutomaticSize = Enum.AutomaticSize.Y}, self.pages.Report)
+    round(self.reportBox); inset(self.reportBox, 16); outline(self.reportBox)
+end
+function UI:setReport(text)
+    self.reportChunks = {}
+    local first = 1
+    while first &lt;= #text do
+        local last = math.min(first + 23999, #text)
+        while last &lt; #text do
+            local byte = string.byte(text, last + 1)
+            if not byte or byte &lt; 128 or byte &gt;= 192 then break end
+            last -= 1
+        end
+        table.insert(self.reportChunks, string.sub(text, first, last)); first = last + 1
+    end
+    if #self.reportChunks == 0 then self.reportChunks = {&quot;Empty report&quot;} end
+    self:_showReportPage(1); self:switch(&quot;Report&quot;)
+end
+function UI:_showReportPage(page)
+    self.reportPage = math.clamp(page, 1, #self.reportChunks)
+    self.reportBox.Text = self.reportChunks[self.reportPage]
+    self.reportPageLabel.Text = self.reportPage .. &quot; / &quot; .. #self.reportChunks
+end
+
+function UI:render(state)
+    self.state = state
+    self.contextLabel.Text = if string.sub(state.context, 1, 4) == &quot;Play&quot; then &quot;Live · Play&quot; else &quot;Live · Edit&quot;
+    self.notice.Text = state.notice
+    self.scopeButton.Text = if state.scope == &quot;selection&quot; then &quot;Selection&quot; else &quot;Project&quot;
+    self.scanButton.Text = if state.scanning then &quot;Cancel scan&quot; else &quot;Scan &quot; .. state.scope
+    self.captureButton.Text = if state.cpu.status == &quot;recording&quot; then &quot;Stop CPU&quot; elseif state.cpu.status == &quot;waiting&quot; then &quot;Waiting…&quot; else &quot;Record CPU&quot;
+    self.formatButton.Text = if state.format == &quot;json&quot; then &quot;JSON&quot; else &quot;Markdown&quot;
+    if self.current == &quot;Overview&quot; then
+        for _, key in {&quot;frameMs&quot;, &quot;memoryMb&quot;, &quot;instances&quot;} do
+            local value = state.metrics[key]
+            local suffix = if key == &quot;frameMs&quot; then &quot; ms&quot; elseif key == &quot;memoryMb&quot; then &quot; MB&quot; else &quot;&quot;
+            self.metricValues[key].Text = numeric(value, suffix, if key == &quot;instances&quot; then 0 else 1)
+            self.metricValues[key].TextSize = if type(value) == &quot;number&quot; then 28 else 18
+        end
+        self.metricValues.findings.Text = tostring(#state.findings)
+        self.metricHints.memoryMb.Text = if state.memory.hasBaseline then signed(state.memory.deltaMb, &quot; MB change&quot;) else &quot;Studio session&quot;
+        local maximum = 33.3
+        local start = math.max(1, #state.samples - 59)
+        for index = start, #state.samples do maximum = math.max(maximum, (state.samples[index].frameMs or 0) * 1.08) end
+        for index, bar in self.bars do
+            local sample = state.samples[start + index - 1]
+            local value = if sample then sample.frameMs else nil
+            bar.Size = UDim2.new(1 / 60, -3, 0, if value then math.max(2, value / maximum * 68) else 0)
+        end
+        self.chartSummary.Text = &quot;p95 &quot; .. numeric(state.metrics.p95FrameMs, &quot; ms&quot;) .. &quot;   ·   Scale 0–&quot; .. numeric(maximum, &quot; ms&quot;)
+    elseif self.current == &quot;Findings&quot; then self:_renderFindings(state)
+    elseif self.current == &quot;CPU&quot; then self:_renderCPU(state)
+    elseif self.current == &quot;Memory&quot; then self:_renderMemory(state) end
+    self:_layout()
+end
+function UI:destroy()
+    for _, connection in self.connections do connection:Disconnect() end
+    for _, connections in self.pageConnections do for _, connection in connections do connection:Disconnect() end end
+    self.root:Destroy()
+end
+return UI
+</ProtectedString></Properties></Item></Item></roblox>

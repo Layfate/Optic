@@ -1,0 +1,14 @@
+node_modules/
+*.log
+.DS_Store
+
+# Local Studio runs and backup files; retain only the final review evidence.
+/test-results/*
+!/test-results/studio-acceptance.json
+!/test-results/visual-refresh-acceptance.json
+!/test-results/optic-visual-refresh.png
+
+# Local credentials and machine-specific settings.
+.env
+.env.*
+!.env.example

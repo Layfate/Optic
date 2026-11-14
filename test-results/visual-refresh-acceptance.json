@@ -1,0 +1,15 @@
+{
+  "date": "2026-11-14",
+  "theme": "Soft charcoal with lavender accents derived from the supplied logo",
+  "fonts": {"ui": "BuilderSans", "medium": "BuilderSansMedium", "headings": "BuilderSansBold", "report": "RobotoMono"},
+  "logo": {"asset": "rbxassetid://132748276015974", "nativeIsLoaded": true, "sourceUnchanged": true},
+  "nativeTextBounds": {"widths": [800, 700, 680, 480, 426], "views": ["Overview", "Findings", "CPU", "Memory", "Report"], "overflowFindings": 0},
+  "actions": {"projectScan": true, "search": true, "sourceNavigation": true, "baseline": true, "jsonAndMarkdown": true, "pauseOnClose": true},
+  "realCpuCapture": {"durationMs": 3014, "renderedFunctionRows": 50, "status": "PASS"},
+  "independentReview": "No confirmed Critical or Important regressions; narrow metric text risk checked in native Studio.",
+  "consoleErrors": 0,
+  "automatedChecks": 51,
+  "testBridgeInDistribution": false,
+  "cleanInstall": {"bridgeAbsent": true, "logoLoaded": true, "widgetWidth": 796, "widgetHeight": 714, "sha256": "4B1B3DE241618AC38D0383F2254E34CA016B334EA95BC5D63E828DF4D7983BF3"},
+  "screenshot": "optic-visual-refresh.png"
+}
