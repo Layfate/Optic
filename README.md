@@ -84,7 +84,7 @@ To produce the binary release model, install [Rojo](https://rojo.space/docs/v7/g
 npm.cmd run build:rbxm
 ```
 
-`optic.project.json` packages the same Script root and ModuleScript children as the XML build. Rojo is a build tool only and is not required to use Optic. Release assets include SHA-256 checksums in `SHA256SUMS.txt`.
+`optic.project.json` packages the same Script root and ModuleScript children as the XML build. Rojo is a build tool only and is not required to use Optic.
 
 ```text
 src/                     Native plugin entry, UI, service adapters and pure core
